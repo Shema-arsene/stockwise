@@ -1,0 +1,555 @@
+// StockWise data model.
+//
+// Conventions
+// - Money is stored as integer ngwee (K1 = 100 ngwee) in BigInt columns.
+// - Quantities are Decimal(14,3) so products sold by kg/litre work.
+// - Every table the client syncs ("synced tables") has:
+//     id (client-generated UUIDv7), shopId, createdAt, updatedAt, deletedAt, seq
+//   `seq` is a per-shop, strictly increasing change number assigned by the server
+//   (from Shop.seq) whenever a row is written. Clients pull "everything with seq > cursor".
+// - Stock on hand is NEVER stored. It is the sum of StockMovement.qty for a product.
+//   Customer debt is credit sales minus DebtPayments. Both are append-only, so offline
+//   devices can merge without conflicts.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Auth (Better Auth) ─────────────────────────────
+
+model User {
+  id                  String           @id
+  name                String
+  email               String           @unique
+  emailVerified       Boolean          @default(false)
+  image               String?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+  // Better Auth username plugin: PIN accounts sign in with username + PIN.
+  username            String?          @unique
+  // StockWise staff (founder / super admins). Null for every customer account.
+  platformRole        PlatformRole?
+  // Set for username+PIN accounts a business created; that business may reset the PIN.
+  managedByBusinessId String?
+  failedLogins        Int              @default(0)
+  lockedUntil         DateTime?
+  // Set by StockWise staff: the account cannot sign in at all until reactivated.
+  deactivatedAt       DateTime?
+  sessions            Session[]
+  accounts            Account[]
+  memberships         Membership[]
+  businessRoles       BusinessMember[]
+
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+model RateLimit {
+  id          String @id
+  key         String @unique
+  count       Int
+  lastRequest BigInt
+
+  @@map("rate_limit")
+}
+
+// ───────────────────────────── Tenancy ─────────────────────────────
+
+// Platform level: the StockWise company. Exactly one FOUNDER (enforced by a partial unique index).
+enum PlatformRole {
+  FOUNDER
+  SUPER_ADMIN
+}
+
+// Business level ("shop" in the UI): one OWNER per business, the person who is billed.
+// MANAGER here means a manager of every branch of that business, including future ones.
+enum BusinessRole {
+  OWNER
+  MANAGER
+}
+
+// Branch level (the `shop` table is a branch in the UI): people assigned to individual branches.
+enum ShopRole {
+  MANAGER
+  CASHIER
+}
+
+enum BusinessStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum Plan {
+  FREE
+  TRIAL
+  BASIC
+  PRO
+}
+
+model Business {
+  id          String         @id
+  name        String
+  plan        Plan           @default(FREE)
+  trialEndsAt DateTime?
+  status      BusinessStatus @default(ACTIVE)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  shops   Shop[]
+  members BusinessMember[]
+
+  @@map("business")
+}
+
+model BusinessMember {
+  id         String       @id
+  businessId String
+  userId     String
+  role       BusinessRole
+  createdAt  DateTime     @default(now())
+  // Same meaning as on Membership: no access, but offline work made before then still syncs.
+  disabledAt DateTime?
+  deletedAt  DateTime?
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // One owner per business is enforced by a partial unique index (see migration).
+  @@unique([businessId, userId])
+  @@index([userId])
+  @@map("business_member")
+}
+
+model Shop {
+  id         String   @id
+  businessId String
+  name       String
+  phone      String?
+  address    String?
+  currency   String   @default("ZMW")
+  locale     String   @default("en")
+  vatEnabled Boolean  @default(false)
+  vatRate    Int      @default(1600) // basis points: 1600 = 16.00%
+  tpin       String? // ZRA taxpayer number, shown on receipts when VAT is on
+  seq        BigInt   @default(0) // last change number handed out for this shop
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business       Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  memberships    Membership[]
+  invitations    Invitation[]
+  categories     Category[]
+  products       Product[]
+  customers      Customer[]
+  suppliers      Supplier[]
+  stockMovements StockMovement[]
+  sales          Sale[]
+  saleItems      SaleItem[]
+  purchases      Purchase[]
+  purchaseItems  PurchaseItem[]
+  debtPayments   DebtPayment[]
+  supplierPayments SupplierPayment[]
+
+  @@index([businessId])
+  @@map("shop")
+}
+
+model Membership {
+  id         String    @id
+  shopId     String
+  userId     String
+  role       ShopRole
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  // Disabled: no access, reversible. Deleted: removed. Sales made offline before either
+  // moment are still accepted when the device syncs.
+  disabledAt DateTime?
+  deletedAt  DateTime?
+  seq        BigInt    @default(0)
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, userId])
+  @@index([userId])
+  @@index([shopId, seq])
+  @@map("membership")
+}
+
+model Invitation {
+  id          String    @id
+  shopId      String
+  email       String?
+  role        ShopRole
+  // A manager invited for every branch of the business rather than this one branch.
+  allBranches Boolean   @default(false)
+  token       String    @unique
+  invitedBy   String
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@map("invitation")
+}
+
+// ───────────────────────────── Inventory ─────────────────────────────
+
+model Category {
+  id        String    @id
+  shopId    String
+  name      String
+  createdAt DateTime
+  updatedAt DateTime
+  deletedAt DateTime?
+  seq       BigInt
+
+  shop     Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  products Product[]
+
+  @@index([shopId, seq])
+  @@map("category")
+}
+
+model Product {
+  id            String    @id
+  shopId        String
+  categoryId    String?
+  name          String
+  sku           String?
+  unit          String    @default("pcs") // pcs, kg, g, l, ml, box, pack, bag, dozen
+  costPrice     BigInt    @default(0) // ngwee per unit
+  sellPrice     BigInt    @default(0) // ngwee per unit
+  reorderLevel  Decimal   @default(0) @db.Decimal(14, 3)
+  vatApplicable Boolean   @default(true)
+  createdAt     DateTime
+  updatedAt     DateTime
+  deletedAt     DateTime?
+  seq           BigInt
+
+  shop           Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  category       Category?       @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  stockMovements StockMovement[]
+  saleItems      SaleItem[]
+  purchaseItems  PurchaseItem[]
+
+  @@index([shopId, seq])
+  @@map("product")
+}
+
+enum MovementType {
+  OPENING // initial stock when a product is created
+  PURCHASE
+  SALE
+  ADJUSTMENT // manual correction: damaged, expired, count difference
+  VOID // reversal of a voided sale or purchase
+}
+
+// Append-only. qty > 0 adds stock, qty < 0 removes it.
+model StockMovement {
+  id        String       @id
+  shopId    String
+  productId String
+  qty       Decimal      @db.Decimal(14, 3)
+  type      MovementType
+  refId     String? // sale / purchase id this movement belongs to
+  note      String?
+  userId    String
+  createdAt DateTime
+  updatedAt DateTime
+  deletedAt DateTime?
+  seq       BigInt
+
+  shop    Shop    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, seq])
+  @@index([productId])
+  @@map("stock_movement")
+}
+
+// ───────────────────────────── People ─────────────────────────────
+
+model Customer {
+  id        String    @id
+  shopId    String
+  name      String
+  phone     String?
+  address   String?
+  note      String?
+  createdAt DateTime
+  updatedAt DateTime
+  deletedAt DateTime?
+  seq       BigInt
+
+  shop         Shop          @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  sales        Sale[]
+  debtPayments DebtPayment[]
+
+  @@index([shopId, seq])
+  @@map("customer")
+}
+
+model Supplier {
+  id        String    @id
+  shopId    String
+  name      String
+  phone     String?
+  address   String?
+  createdAt DateTime
+  updatedAt DateTime
+  deletedAt DateTime?
+  seq       BigInt
+
+  shop      Shop              @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  purchases Purchase[]
+  payments  SupplierPayment[]
+
+  @@index([shopId, seq])
+  @@map("supplier")
+}
+
+// ───────────────────────────── Transactions ─────────────────────────────
+
+enum PaymentType {
+  CASH
+  MOBILE_MONEY
+  CREDIT // customer owes the full total; repaid through DebtPayment
+}
+
+model Sale {
+  id          String      @id
+  shopId      String
+  number      String // human-readable receipt number, unique per device prefix
+  customerId  String?
+  paymentType PaymentType
+  subtotal    BigInt // ngwee, before VAT
+  vatAmount   BigInt      @default(0)
+  total       BigInt // subtotal + vatAmount
+  amountPaid  BigInt // paid at the time of sale; total - amountPaid becomes customer debt
+  costTotal   BigInt // cost of goods at time of sale (for profit)
+  note        String?
+  userId      String
+  soldAt      DateTime
+  voidedAt    DateTime?
+  createdAt   DateTime
+  updatedAt   DateTime
+  deletedAt   DateTime?
+  seq         BigInt
+
+  shop     Shop       @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  customer Customer?  @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  items    SaleItem[]
+
+  @@index([shopId, seq])
+  @@index([shopId, soldAt])
+  @@index([customerId])
+  @@map("sale")
+}
+
+model SaleItem {
+  id        String    @id
+  shopId    String
+  saleId    String
+  productId String
+  qty       Decimal   @db.Decimal(14, 3)
+  unitPrice BigInt // ngwee, before VAT
+  unitCost  BigInt // cost snapshot
+  vatAmount BigInt    @default(0)
+  lineTotal BigInt // qty * unitPrice + vat, rounded
+  createdAt DateTime
+  updatedAt DateTime
+  deletedAt DateTime?
+  seq       BigInt
+
+  shop    Shop    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  sale    Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, seq])
+  @@index([saleId])
+  @@map("sale_item")
+}
+
+model Purchase {
+  id          String    @id
+  shopId      String
+  supplierId  String?
+  total       BigInt
+  amountPaid  BigInt // paid at the time of purchase; the rest is owed to the supplier
+  paid        Boolean   @default(true) // amountPaid >= total (kept for older app versions)
+  note        String?
+  userId      String
+  purchasedAt DateTime
+  voidedAt    DateTime?
+  createdAt   DateTime
+  updatedAt   DateTime
+  deletedAt   DateTime?
+  seq         BigInt
+
+  shop     Shop           @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  supplier Supplier?      @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  items    PurchaseItem[]
+
+  @@index([shopId, seq])
+  @@index([shopId, purchasedAt])
+  @@index([supplierId])
+  @@map("purchase")
+}
+
+model PurchaseItem {
+  id         String    @id
+  shopId     String
+  purchaseId String
+  productId  String
+  qty        Decimal   @db.Decimal(14, 3)
+  unitCost   BigInt
+  lineTotal  BigInt
+  createdAt  DateTime
+  updatedAt  DateTime
+  deletedAt  DateTime?
+  seq        BigInt
+
+  shop     Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  purchase Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, seq])
+  @@index([purchaseId])
+  @@map("purchase_item")
+}
+
+model DebtPayment {
+  id         String      @id
+  shopId     String
+  customerId String
+  amount     BigInt
+  method     PaymentType // CASH or MOBILE_MONEY
+  note       String?
+  userId     String
+  paidAt     DateTime
+  voidedAt   DateTime?
+  createdAt  DateTime
+  updatedAt  DateTime
+  deletedAt  DateTime?
+  seq        BigInt
+
+  shop     Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, seq])
+  @@index([customerId])
+  @@map("debt_payment")
+}
+
+// Money the shop pays a supplier towards what it owes for purchases made on credit.
+model SupplierPayment {
+  id         String      @id
+  shopId     String
+  supplierId String
+  amount     BigInt
+  method     PaymentType // CASH or MOBILE_MONEY
+  note       String?
+  userId     String
+  paidAt     DateTime
+  voidedAt   DateTime?
+  createdAt  DateTime
+  updatedAt  DateTime
+  deletedAt  DateTime?
+  seq        BigInt
+
+  shop     Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, seq])
+  @@index([supplierId])
+  @@map("supplier_payment")
+}
+
+// Request counters for API rate limiting (fixed one-minute windows), shared by all server instances.
+model ApiRateLimit {
+  key     String   @id
+  count   Int
+  resetAt DateTime
+
+  @@map("api_rate_limit")
+}
+
+// ───────────────────────────── Activity log ─────────────────────────────
+
+// Append-only record of every action. No foreign keys, so deleting a shop or user never
+// removes history, and a database trigger (see migration) rejects UPDATE and DELETE.
+model ActivityLog {
+  id         String    @id
+  at         DateTime  @default(now()) // server time
+  clientAt   DateTime? // device time, for actions recorded offline
+  actorId    String?
+  actorName  String?
+  actorRole  String?
+  businessId String?
+  shopId     String?
+  action     String // e.g. "sale.create", "staff.role", "auth.sign_in_failed"
+  entity     String?
+  entityId   String?
+  summary    Json?
+  deviceId   String?
+  ip         String?
+
+  @@index([businessId, at])
+  @@index([at])
+  @@index([actorId, at])
+  @@map("activity_log")
+}
