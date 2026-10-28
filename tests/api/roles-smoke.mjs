@@ -1,11 +1,11 @@
 // End-to-end API checks for roles, accounts and logs, run against a running server:
-//   node tests/api/roles-smoke.mjs http://localhost:3100
+//   node tests/api/roles-smoke.mjs http://localhost:3000
 // Needs the seeded super admin (support@stockwise.app / demo-password) and auth rate limiting off
 // (dev mode, or DISABLE_AUTH_RATE_LIMIT=1). Creates throwaway accounts named *@e2e.test.
 
 import { randomUUID } from "node:crypto";
 
-const BASE = process.argv[2] ?? "http://localhost:3100";
+const BASE = process.argv[2] ?? "http://localhost:3000";
 const stamp = Date.now();
 let failures = 0;
 

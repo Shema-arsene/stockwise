@@ -13,7 +13,7 @@ npm install                 # also generates the Prisma client
 cp .env.example .env        # fill in Neon URLs and BETTER_AUTH_SECRET
 npm run db:migrate          # create tables
 npm run db:seed             # optional demo business, see below
-npm run dev                 # http://localhost:3100
+npm run dev                 # http://localhost:3000, or the next free port Next.js prints
 ```
 
 The service worker (offline mode) only runs in production builds: `npm run build && npm start`.
@@ -161,7 +161,7 @@ tests/e2e/                    Playwright tests (including the two-device offline
 ```bash
 npm test                      # unit tests (money, VAT, debt aging, reports, permissions, schemas)
 npm run build && npm run test:e2e   # end-to-end on a production build (port 3200)
-node tests/api/roles-smoke.mjs http://localhost:3100   # 54 permission, account, supplier-credit and log checks against a running server
+node tests/api/roles-smoke.mjs http://localhost:3000   # 54 permission, account, supplier-credit and log checks against a running server
 ```
 
 The end-to-end tests create real accounts named `*@e2e.test` in the database they point at, so run them against a development branch, not production.

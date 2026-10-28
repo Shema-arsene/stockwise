@@ -48,6 +48,9 @@ async function logSignIn(user: { id: string; name: string } | null, action: stri
 export const auth = betterAuth({
   appName: "StockWise",
   database: prismaAdapter(prisma, { provider: "postgresql" }),
+  // `next dev` picks the next free port (3000, 3001, …), so locally any localhost port may sign in.
+  // In production only BETTER_AUTH_URL is trusted.
+  trustedOrigins: process.env.NODE_ENV === "production" ? [] : ["http://localhost:*", "http://127.0.0.1:*"],
   emailAndPassword: {
     enabled: true,
     // Lowest common length (staff logins). Email sign-ups are held to EMAIL_PASSWORD_MIN below.
