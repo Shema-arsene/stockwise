@@ -4,6 +4,7 @@ import type { Prisma } from "@/generated/prisma/client";
 import { can, type Permission } from "@/lib/permissions";
 import type { ShopContext } from "@/lib/api/context";
 import { actorFrom, logActivities, type ActivityEntry } from "@/lib/api/activity";
+import { timed } from "@/lib/api/telemetry";
 import {
   TABLES,
   TABLE_ORDER,
@@ -258,7 +259,7 @@ export async function applyPush(ctx: ShopContext, mutations: PushMutation[], dev
   if (total === 0) return { applied: 0, rejected };
 
   let applied = 0;
-  await prisma.$transaction(
+  await timed("sync.push.transaction", () => prisma.$transaction(
     async (tx) => {
       // Rows + one extra per sale whose cost total we recompute.
       let nextSeq = await reserveSeq(tx, ctx.shopId, total * 2);
@@ -413,7 +414,7 @@ export async function applyPush(ctx: ShopContext, mutations: PushMutation[], dev
       await logActivities(actorFrom(ctx.user, ctx.role), activity, tx);
     },
     { timeout: 30_000, maxWait: 10_000 },
-  );
+  ));
 
   return { applied, rejected };
 }
