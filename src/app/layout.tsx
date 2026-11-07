@@ -14,6 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL(process.env.BETTER_AUTH_URL ?? "http://localhost:3000"),
   title: {
     default: "StockWise — bookkeeping & stock for shops",
     template: "%s · StockWise",

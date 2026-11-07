@@ -8,13 +8,18 @@ Next.js 16 (App Router), React 19, Tailwind 4 + shadcn/ui, next-intl, Prisma 7 o
 
 ## Getting started
 
+Requirements: Node.js 20.19+, 22.12+, or 24+, plus a Neon PostgreSQL database.
+
 ```bash
-npm install                 # also generates the Prisma client
-cp .env.example .env        # fill in Neon URLs and BETTER_AUTH_SECRET
+npm ci                      # also generates the Prisma client
+# Copy .env.example to .env, then fill in the Neon URLs and auth values.
+npm run env:check           # validates the configuration without printing secrets
 npm run db:migrate          # create tables
 npm run db:seed             # optional demo business, see below
-npm run dev                 # http://localhost:3100
+npm run dev                 # http://localhost:3000
 ```
+
+`npm ci` intentionally works before `.env` exists. Commands that build or run the app fail fast with an actionable list of missing or placeholder values. Generate `BETTER_AUTH_SECRET` with the command documented in `.env.example`.
 
 The service worker (offline mode) only runs in production builds: `npm run build && npm start`.
 
@@ -161,10 +166,28 @@ tests/e2e/                    Playwright tests (including the two-device offline
 ```bash
 npm test                      # unit tests (money, VAT, debt aging, reports, permissions, schemas)
 npm run build && npm run test:e2e   # end-to-end on a production build (port 3200)
-node tests/api/roles-smoke.mjs http://localhost:3100   # 54 permission, account, supplier-credit and log checks against a running server
+node tests/api/roles-smoke.mjs http://localhost:3000   # 54 permission, account, supplier-credit and log checks against a running server
+CONFIRM_DISPOSABLE_TEST_DB=1 node tests/api/sync-invariants.mjs http://localhost:3200  # isolated test branch only
+npm run benchmark            # read-only latency sample against BENCHMARK_BASE_URL
 ```
 
+Run `npm run verify` before shipping. It runs linting, Next.js route type generation and type checking, all unit tests, and a production build.
+
 The end-to-end tests create real accounts named `*@e2e.test` in the database they point at, so run them against a development branch, not production.
+
+### CI and performance baseline
+
+The GitHub Actions `code` job runs lint, types, unit tests, the production build, and Prisma schema validation. For the required `database` job, create a **disposable Neon test branch**, add repository secrets `TEST_DATABASE_URL` (pooled), `TEST_DIRECT_URL` (direct), and `TEST_BETTER_AUTH_SECRET`, then set repository variable `STOCKWISE_TEST_DB_READY=1`. The database job migrates and seeds that branch, runs the role API checks, transaction rollback and sync invariants, PDF/XLSX download smoke checks, a read-only HTTP benchmark, and the five Playwright workflows. It creates test accounts and 2,007 sales, so never point these secrets at production. The job fails until these values are configured; require both jobs in branch protection.
+
+For comparable baseline runs, set `BENCHMARK_BASE_URL`, `BENCHMARK_ITERATIONS` (5–1000), and optionally `BENCHMARK_COOKIE` and `BENCHMARK_SHOP_ID` to include an authenticated full pull. Capture the JSON output plus deployment region, fixture size, concurrency, database CPU/connections/query time, function memory, error rate, sync completion time, report durations, and build size in the monitoring system for both runs. Use the same inputs before and after each change. Investigate a phase if p95 sync latency increases by more than 10%, error rate by more than 0.1 percentage points, or resource use rises materially. The script is a repeatable local sample; production traffic and concurrency baselines still require deployment monitoring.
+
+Save comparable samples with `node scripts/benchmark.mjs > before.json` and `node scripts/benchmark.mjs > after.json`, then run `npm run benchmark:compare -- before.json after.json`. The comparator rejects different route sets or iteration counts and flags the initial p95 sync and 5xx guardrails; verify dataset, region, concurrency, and resource metrics separately.
+
+### Telemetry and module boundaries
+
+API responses include `x-request-id`; server logs contain JSON events for route duration, sync push/pull, report scope/query/render, and errors. They exclude request bodies, credentials, customer details, and report contents. Successful requests are sampled per request at `TELEMETRY_SUCCESS_SAMPLE_RATE` (default 0.1); errors are retained. Set `TELEMETRY_ENABLED=0` to disable server events. Set `NEXT_PUBLIC_SYNC_TELEMETRY=1` at build time to sample aggregate client sync duration and pending outbox age; telemetry failures do not block sync. Capture server stdout in the deployment log system, group by `event` and `route`, and alert on API error rate, sync failures/timeouts, old pending changes, and long report renders. No external exporter is required.
+
+Routes under `src/app/api/shops` delegate to `src/lib/api/shops.ts`; report scope and access queries live in `src/lib/api/report-scope.ts`. The sync ledger and append-only activity log still share the same Prisma transaction. Introduce later modules one operation group at a time, with the database and browser suite passing at each deployment. Large report jobs and a server transactional outbox remain conditional on measured need or a concrete external consumer.
 
 ## Landing page
 
@@ -175,8 +198,11 @@ The public page at `/` is built from `src/components/landing/*`, with its text u
 
 ## Deploying (Vercel + Neon)
 
-1. Import the repo in Vercel. Region `fra1` is set in `vercel.json`, next to Neon's `eu-central-1`.
-2. Set the environment variables `DATABASE_URL`, `DIRECT_URL`, `BETTER_AUTH_SECRET`, and `BETTER_AUTH_URL` (your production URL).
-3. Deploy. The build runs `prisma migrate deploy` first.
+1. Link the intended Neon project and branch. `neon.ts` declares the private `uploads` bucket, Realtime, and a protected StockWise Function. Keep `STOCKWISE_ORIGIN_SECRET` in the ignored `.env`, then run `neon config plan --env .env` and `neon deploy --env .env`. The deploy pulls `NEON_FUNCTION_STOCKWISE_BASE_URL` into `.env`; `STOCKWISE_FUNCTION_URL` is an optional override.
+2. Apply the four Prisma migrations with `npm run db:deploy` only after verifying the branch and direct connection. Do not seed a production branch with demo accounts.
+3. Run `npm run neon:smoke`. It checks Postgres, writes/reads/deletes one temporary private object, verifies the Function rejects an unsigned request and answers an authorized one, and receives a Realtime initial snapshot. The platform-only `/api/platform/neon-check` route uses the same checks without exposing credentials.
+4. Import the repo in Vercel. Region `fra1` is set in `vercel.json`, next to Neon's `eu-central-1`. Set `DATABASE_URL_POOLED` (or pooled `DATABASE_URL`), `DIRECT_URL` (or `DATABASE_URL_UNPOOLED`), `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` (your deployed URL), the Neon `AWS_*` storage variables, `NEON_REALTIME_URL`, `NEON_REALTIME_SECRET`, `STOCKWISE_ORIGIN_SECRET`, and `NEON_FUNCTION_STOCKWISE_BASE_URL`. Set `S3_BUCKET=uploads`.
+5. Deploy and run the staging and browser gates before routing production traffic. The Vercel build runs `prisma migrate deploy` first.
 
 Use a fresh `BETTER_AUTH_SECRET` and a separate Neon branch for production.
+The diagnostic service integrations do not change StockWise's device outbox or push/pull protocol. Set `NEXT_PUBLIC_NEON_REALTIME_SYNC=1` at build time to subscribe to each active shop's change counter and wake the existing sync engine when it advances. The live query checks active membership and account state. The 30-second poll remains the fallback; leave the flag off until staging latency and reliability checks pass.

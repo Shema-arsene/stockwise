@@ -5,6 +5,7 @@ import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db/prisma";
 import { rateLimit } from "./rate-limit";
 import { can, canPlatform, type Permission, type PlatformPermission, type PlatformRole, type Role } from "@/lib/permissions";
+import { metric, requestId, withRequest } from "./telemetry";
 
 export class HttpError extends Error {
   constructor(
@@ -134,21 +135,26 @@ export async function requirePlatform(req: Request, permission: PlatformPermissi
 }
 
 /** Wraps a route handler so thrown HttpErrors / validation errors become JSON responses. */
-export function handle<Args extends unknown[]>(fn: (...args: Args) => Promise<Response>) {
-  return async (...args: Args): Promise<Response> => {
+export function handle<Args extends [Request, ...unknown[]]>(fn: (...args: Args) => Promise<Response>) {
+  return async (...args: Args): Promise<Response> => withRequest(args[0], async () => {
+    const start = performance.now();
+    let response: Response;
     try {
-      return await fn(...args);
+      response = await fn(...args);
     } catch (err) {
       if (err instanceof HttpError) {
-        return NextResponse.json({ error: err.code, message: err.message }, { status: err.status, headers: err.headers });
+        response = NextResponse.json({ error: err.code, message: err.message }, { status: err.status, headers: err.headers });
+      } else if (err instanceof ZodError) {
+        response = NextResponse.json({ error: "invalid", issues: err.issues }, { status: 422 });
+      } else {
+        metric("api.unhandled_error", { errorType: err instanceof Error ? err.name : "unknown" });
+        response = NextResponse.json({ error: "server_error" }, { status: 500 });
       }
-      if (err instanceof ZodError) {
-        return NextResponse.json({ error: "invalid", issues: err.issues }, { status: 422 });
-      }
-      console.error(err);
-      return NextResponse.json({ error: "server_error" }, { status: 500 });
     }
-  };
+    response.headers.set("x-request-id", requestId()!);
+    metric("api.request", { status: response.status, durationMs: Math.round(performance.now() - start) });
+    return response;
+  });
 }
 
 /** JSON response that serialises BigInt (money, seq) as plain numbers. */

@@ -7,6 +7,7 @@ import { http, apiStatus, setActiveShopHeader } from "@/lib/http";
 import { can as canRole, type Permission, type Role } from "@/lib/permissions";
 import { META, openShopDB, type Member, type ShopDB, type ShopSettings } from "@/lib/local/db";
 import { SyncEngine, type SyncState } from "@/lib/local/sync";
+import { watchRealtimeSync } from "@/lib/local/realtime-sync";
 import { getSession, saveSession, useCachedSession, type CachedSession, clearSession } from "@/lib/local/session";
 
 interface ShopContextValue {
@@ -131,7 +132,9 @@ function ShopRuntime({
     setActiveShopHeader(shopId);
     const unsubscribe = engine.subscribe(setSync);
     void engine.start();
+    const stopRealtime = watchRealtimeSync(engine, shopId);
     return () => {
+      stopRealtime();
       unsubscribe();
       engine.stop();
     };
