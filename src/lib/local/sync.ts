@@ -115,6 +115,7 @@ export class SyncEngine {
       return;
     }
     this.set({ status: "syncing", lastError: null });
+    const started = performance.now();
     try {
       await this.push();
       await this.pull();
@@ -133,6 +134,19 @@ export class SyncEngine {
         setTimeout(() => void this.syncNow(), Math.min(wait, 120) * 1000);
       }
       else this.set({ status: "error", lastError: err instanceof Error ? err.message : String(err) });
+    } finally {
+      // Aggregate-only sample. The request is deliberately detached from sync success.
+      if (process.env.NEXT_PUBLIC_SYNC_TELEMETRY === "1" && (this.state.status !== "idle" || Math.random() < 0.1)) {
+        void Promise.all([this.db.outbox.orderBy("seq").first(), this.db.outbox.count()]).then(([oldest, pending]) => {
+          const oldestPendingMs = oldest ? Math.min(30 * 86_400_000, Math.max(0, Date.now() - new Date(oldest.createdAt).getTime())) : 0;
+          return http.post("/telemetry/sync", {
+            durationMs: Math.round(performance.now() - started),
+            pending,
+            oldestPendingMs,
+            outcome: this.state.status,
+          }, { timeout: 5000 });
+        }).catch(() => {});
+      }
     }
   }
 
